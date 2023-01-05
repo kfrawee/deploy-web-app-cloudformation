@@ -1,0 +1,276 @@
+Description: |
+  DevOps-ND-Project 2 - Deploy a high-availability web app using CloudFormation - Servers Resources
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: ""
+  WebServersLatestAmiId:
+    Description: Region specific image from the Parameter Store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id
+  JumpBoxLatestAmiId:
+    Description: Region specific image from the Parameter Store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  JumpBoxKeyName:
+    Description: key-name for bastion host (jump box) to allow you to SSH into your private subnet servers.
+    Type: String
+    Default: udacity-demo
+
+Resources:
+  ### S3, Policy and IAM roles ###
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    # DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+      BucketName:
+        Fn::Join:
+          - "-"
+          - - "bucket"
+            - "Ref": AWS::AccountId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Bucket
+        - Key: Service
+          Value: !Sub ${EnvironmentName}
+
+  UdacityS3ReadOnlyEC2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-S3-Role
+        - Key: Service
+          Value: !Sub ${EnvironmentName}
+
+  ProfileWithRolesForOurApp:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref UdacityS3ReadOnlyEC2
+
+  ### Servers, Security Groups, Auto Scaling Groups, Load balancer ###
+  # Security Groups
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from anywhere to the Web Servers
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow only SSH from the Jump Box and HTTP from the LB
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  # Auto Scaling Launch Configuration
+  WebAppLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref WebServersLatestAmiId
+      InstanceType: t2.medium # two vCPUs and 4GB of RAM
+      # KeyName: !Ref JumpBoxKeyName # for debugging
+      InstanceMonitoring: true
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      IamInstanceProfile: !Ref ProfileWithRolesForOurApp
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 10
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt update -y
+          sudo apt install apache2 awscli -y
+
+          sudo systemctl start apache2.service
+          sudo systemctl enable apache2.service
+
+          sudo chmod 777 /var/www/html -R
+          cd /var/www/html/
+          echo "<h1>It works! Udagram, Udacity</h1> <p>Response from: $(hostname -f)</p>" > index.html
+
+  # Auto Scaling Group
+  WebAppGroupAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    # UpdatePolicy:
+    #   AutoScalingReplacingUpdate:
+    #     WillReplace: true
+    Properties:
+      MinSize: "2"
+      MaxSize: "4"
+      DesiredCapacity: "2"
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PRIV-NETS
+        # - Fn::ImportValue: !Sub ${EnvironmentName}-PUB-NETS # debug
+      LaunchConfigurationName: !Ref WebAppLaunchConfiguration
+      TargetGroupARNs:
+        - !Ref WebAppTargetGroup
+
+  # Application Load Balancer (ALB)
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-ALB
+      Subnets:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PUB1-SN
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PUB2-SN
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ALB
+        - Key: Service
+          Value: !Sub ${EnvironmentName}
+
+  # Listener
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Listener Rule
+  ELBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /
+      ListenerArn: !Ref Listener
+      Priority: 1
+
+  # Target Group
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPCId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-TargetGroups
+        - Key: Service
+          Value: !Sub ${EnvironmentName}
+
+  ### Jump box to Allow SSH into our private subnet servers ###
+  # Jump Box Security Group
+  JumpBoxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH into our private subnet servers
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-SG-JumpBox
+        - Key: Service
+          Value: !Sub ${EnvironmentName}
+      VpcId:
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPCId
+
+  # Jump Box Server
+  JumpBoxServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref JumpBoxLatestAmiId
+      InstanceType: t2.micro
+      KeyName: !Ref JumpBoxKeyName
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Server
+        - Key: Service
+          Value: !Sub ${EnvironmentName}
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: "0"
+          GroupSet:
+            - !Ref JumpBoxSecurityGroup
+          SubnetId:
+            Fn::ImportValue: !Sub ${EnvironmentName}-PUB1-SN
+
+Outputs:
+  JumpBoxPublicIP:
+    Description: Jump Box public IP for SSH Access
+    Value: !GetAtt JumpBoxServer.PublicIp
+    Export:
+      Name: !Sub ${EnvironmentName}-JumpBox-PublicIp
+  LoadBalancerDNSName:
+    Description: load balancer DNS Name
+    Value: !Join
+      - ""
+      - - "http://"
+        - !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-ELB-DNS-Name
+  S3BucketName:
+    Description: S3 bucket Name
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub ${EnvironmentName}-Bucket
