@@ -16,7 +16,7 @@ This needs to be automated so that the infrastructure can be discarded as soon a
 
 <br>
 <p align="center">
-<img src="imgs\Udacity DevOps - 2nd Project - Architecture Diagram.png" title="Entity Relationship Diagram (ERD)" alt="Architecture Diagram" width=100%><br>
+<img src="imgs\Udacity DevOps - 2nd Project - Architecture Diagram.png" title="Architecture Diagram" alt="Architecture Diagram" width=100%><br>
 <b>Architecture Diagram</b>
 </p>
 
